@@ -72,7 +72,7 @@ public:
   virtual ~ThreadPool()
   {
     shutdown();
-    cleaner_.waitAllWorkersJoin();
+    worker_manager_.waitAllWorkersJoin();
   };
 
    
@@ -112,7 +112,7 @@ public:
     if (core_pool_size <= 0 || max_pool_size <= 0 || max_pool_size < core_pool_size || keep_alive_time.count() < 0)
       throw std::invalid_argument("Invalid argument");
 
-    cleaner_.run(*this);
+    worker_manager_.run(*this);
   }
 
   template <typename Rep, typename Period>
@@ -127,7 +127,7 @@ public:
     if (core_pool_size <= 0 || max_pool_size <= 0 || max_pool_size < core_pool_size || keep_alive_time.count() < 0)
       throw std::invalid_argument("Invalid argument");
 
-    cleaner_.run(*this);
+    worker_manager_.run(*this);
   }
 
   /// \fn void execute(std::shared_ptr<Task> task)
@@ -237,8 +237,8 @@ public:
 
       std::lock_guard<decltype(main_lock_)> lock(main_lock_);
 
-      // If workers_.size() > 0, that means some workers are not joined.
-      if(workers_.size() > 0)
+      // If worker_manager_.size() > 0, that means some workers are not joined.
+      if(worker_manager_.size() > 0)
         return ;
 
       try
@@ -307,19 +307,29 @@ private:
   {
     void run(ThreadPool &pool)
     {
-      thread_ = std::thread(&ThreadPool::runWorkerCleaner, std::ref(pool), std::ref(*this));
+      thread_ = std::thread(&ThreadPool::deleteWorkers, std::ref(pool), std::ref(*this));
     }
 
-    void remove(Worker *w, ThreadPool &pool)
+    void add(std::shared_ptr<Worker> w)
     {
-      auto it = pool.workers_.begin();
-      while (it != pool.workers_.end() && it->get() != w)
+      workers_.insert(w);
+    }
+
+    void remove(std::shared_ptr<Worker> w)
+    {
+      workers_.erase(w);
+    }
+
+    void remove(Worker *w)
+    {
+      auto it = workers_.begin();
+      while (it != workers_.end() && it->get() != w)
         ++it;
-      assert(it != pool.workers_.end() && "Try to remove a nonexistent worker!");
+      assert(it != workers_.end() && "Try to remove a nonexistent worker!");
 
       std::lock_guard<decltype(mutex_)> lock(mutex_);
       dead_workers_.push(*it);
-      pool.workers_.erase(it);
+      workers_.erase(it);
       cond_.notify_one();
     }
     
@@ -329,9 +339,15 @@ private:
         thread_.join();
     }
 
+    unsigned size()
+    {
+      return workers_.size();
+    }
+
     std::mutex mutex_;
     std::condition_variable cond_;
     std::thread thread_;
+    std::unordered_set<std::shared_ptr<Worker>> workers_;
     std::queue<std::shared_ptr<Worker>> dead_workers_;
   };
 
@@ -492,8 +508,8 @@ private:
         if (rs < SHUTDOWN ||
             (rs == SHUTDOWN && first_task == nullptr))
         {
-          workers_.insert(w);
-          unsigned s = workers_.size();
+          worker_manager_.add(w);
+          unsigned s = worker_manager_.size();
           if (s > largest_pool_size_)
             largest_pool_size_ = s;
           worker_added = true;
@@ -522,7 +538,7 @@ private:
     try
     {
       if (w != nullptr)
-        workers_.erase(w);
+        worker_manager_.remove(w);
       decrementWorkerCount();
       tryTerminate();
     }
@@ -547,7 +563,7 @@ private:
     {
       std::lock_guard<decltype(main_lock_)> lock(main_lock_);
       completed_task_count_ += w->completed_tasks_;
-      cleaner_.remove(w, *this);
+      worker_manager_.remove(w);
     }
 
     tryTerminate();
@@ -568,18 +584,15 @@ private:
     }
   }
 
-  /**
-   *  
-   */
-  void runWorkerCleaner(WorkerManager &cleaner)
+  void deleteWorkers(WorkerManager &manager)
   {
-    auto &dead_workers = cleaner.dead_workers_;
-    std::unique_lock<std::mutex> lock(cleaner.mutex_);
+    auto &dead_workers = manager.dead_workers_;
+    std::unique_lock<std::mutex> lock(manager.mutex_);
 
     for (;;)
     {
       while (runStateLessThan(ctl_.load(), TIDYING) && dead_workers.empty())
-        cleaner.cond_.wait(lock);
+        manager.cond_.wait(lock);
 
       while (!dead_workers.empty())
       {
@@ -603,7 +616,7 @@ private:
 
       // If the state is advanced to TIDYING, all workers have been enqueued to dead_workers.
       // When dead_workers is also empty, all threads are joined and the thread pool can 
-      // releases safely.
+      // release safely.
       if (runStateAtLeast(ctl_.load(), TIDYING) && dead_workers.empty()) 
         return;
     }
@@ -672,9 +685,8 @@ private:
 
   std::recursive_mutex main_lock_;
   std::condition_variable termination_;
-  std::unordered_set<std::shared_ptr<Worker>> workers_;
   BlockingQueue task_queue_;
-  WorkerManager cleaner_;
+  WorkerManager worker_manager_;
   rejected_execution_handler_type handler_;
 
   unsigned long long completed_task_count_ = 0ull;
