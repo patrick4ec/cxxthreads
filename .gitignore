@@ -31,12 +31,6 @@
 *.out
 *.app
 
-# VS Code Configuration
-.vscode/
-
-# External Libraries
-external/
-
 # Build Directory
 build/
 

@@ -1,4 +1,4 @@
-//===------------------- cxxthreads/thread_pool.h ---------------*- C++ -*-===//
+//===------------------- cxxthreads/threadpool.h ----------------*- C++ -*-===//
 //
 //  Under Apache License v2.0.
 //  Author: Patrick
@@ -13,44 +13,71 @@
 #define CXXTHREADS_THREADPOOL_H
 
 #include "blocking_queue.h"
+#include "null_pointer_exception.h"
 #include "rejected_execution_exception.h"
 #include "task.h"
 #include "util.h"
 
+#include <gsl/util>
+
+#include <boost/thread.hpp>
+
 #include <atomic>
-#include <queue>
-#include <thread>
-#include <unordered_set>
+#include <memory>
+#include <type_traits>
+#include <unordered_map>
+
 
 
 namespace cxxthreads 
 {
 
-/// \class ThreadPool
-/// \brief A dynamic thread pool implementation.
+/// A dynamic thread pool implementation.
 /// \headerfile "cxxthreads/threadpool.h"
 template<typename BlockingQueue>
 class ThreadPool 
 {
 public:
+  /// Type of rejected execution handler.
   using rejected_execution_handler_type = std::function<void(std::shared_ptr<Task> task, ThreadPool &pool)>;
 
+  /// A handler for rejected tasks that throws a RejectedExecutionException.
   struct AbortPolicy
   {
+    ///  Always throws RejectedExecutionException.
+    ///
+    ///  \param task The runnable task requested to be executed.
+    ///  \param pool The pool attempting to execute this task.
+    ///  \throws RejectedExecutionException always
     void operator()(std::shared_ptr<Task> task, ThreadPool &pool)
     {
       throw RejectedExecutionException("Task rejected");
     }
   };
 
+  /// A handler for rejected tasks that silently discards the
+  /// rejected task.
   struct DiscardPolicy
   {
+    /// Does nothing, which has the effect of discarding task.
+    ///
+    /// \param task The runnable task requested to be executed.
+    /// \param pool The executor attempting to execute this task.
     void operator()(std::shared_ptr<Task> task, ThreadPool &pool)
     {}
   };
 
+  /// A handler for rejected tasks that runs the rejected task
+  /// directly in the calling thread of the ThreadPool::execute method,
+  /// unless the executor has been shut down, in which case the task
+  /// is discarded.
   struct CallerRunPolicy
   {
+    /// Executes task in the caller's thread, unless the executor
+    /// has been shut down, in which case the task is discarded.
+    ///
+    /// @param task The runnable task requested to be executed.
+    /// @param pool The executor attempting to execute this task.
     void operator()(std::shared_ptr<Task> task, ThreadPool &pool)
     {
       if (!pool.isShutdown())
@@ -58,7 +85,7 @@ public:
     }
   };
 
-  /* 
+  /*
   struct DiscardOldestPolicy
   {
     void operator()(std::shared_ptr<Task> task, ThreadPool &pool)
@@ -66,40 +93,33 @@ public:
   }; 
   */
 
+  // ThreadPool is non-copyable.
   ThreadPool(const ThreadPool &) = delete;
   ThreadPool &operator=(const ThreadPool &) = delete;
 
+
+  /// All workers join.
   virtual ~ThreadPool()
   {
     shutdown();
     worker_manager_.waitAllWorkersJoin();
-  };
+  }
 
    
-  /// \brief Creates a new ThreadPool with the given initial parameters.
-  /// 
-  /// \param core_pool_size the number of threads to keep in the pool, even
-  ///        if they are idle, unless {@code allowCoreThreadTimeOut} is set
-  /// \param max_pool_size the maximum number of threads to allow in the
-  ///        pool
-  /// \param keep_alive_time when the number of threads is greater than
+  /// Creates a new ThreadPool with the given initial parameters.
+  ///
+  /// \param core_pool_size The number of threads to keep in the pool, even
+  ///        if they are idle, unless allowCoreThreadTimeout is set.
+  /// \param max_pool_size The maximum number of threads to allow in the
+  ///        pool.
+  /// \param keep_alive_time When the number of threads is greater than
   ///        the core, this is the maximum time that excess idle threads
   ///        will wait for new tasks before terminating.
-  /// \param task_queue the queue to use for holding tasks before they are
-  ///        executed.  This queue will hold only the {@code Runnable}
-  ///        tasks submitted by the {@code execute} method.
-  /// \param threadFactory the factory to use when the executor
-  ///        creates a new thread
-  /// \param handler the handler to use when execution is blocked
-  ///        because the thread bounds and queue capacities are reached
-  /// \throws IllegalArgumentException if one of the following holds:<br>
-  ///         {@code corePoolSize < 0}<br>
-  ///         {@code keepAliveTime < 0}<br>
-  ///         {@code maximumPoolSize <= 0}<br>
-  ///         {@code maximumPoolSize < corePoolSize}
-  /// \throws NullPointerException if {@code workQueue}
-  ///         or {@code threadFactory} or {@code handler} is null
-   
+  /// \param task_queue The queue to use for holding tasks before they are
+  ///        executed. This queue will hold only the Task
+  ///        tasks submitted by the execute method.
+  /// \param handler The handler to use when execution is blocked
+  ///        because the thread bounds and queue capacities are reached.
   template <typename Rep, typename Period>
   ThreadPool(unsigned core_pool_size,
              unsigned max_pool_size,
@@ -115,6 +135,11 @@ public:
     worker_manager_.run(*this);
   }
 
+  /// \copydoc ThreadPool::ThreadPool(unsigned core_pool_size,
+  ///                                 unsigned max_pool_size,
+  ///                                 const std::chrono::duration<Rep, Period> &keep_alive_time,
+  ///                                 const BlockingQueue &task_queue,
+  ///                                 const rejected_execution_handler_type &handler = AbortPolicy())
   template <typename Rep, typename Period>
   ThreadPool(unsigned core_pool_size,
              unsigned max_pool_size,
@@ -130,12 +155,36 @@ public:
     worker_manager_.run(*this);
   }
 
-  /// \fn void execute(std::shared_ptr<Task> task)
-  /// \brief Execute a task.
-  /// \param fn a functor
-  /// \param args arguments of the functor
+  /// Execute a task.
+  ///
+  /// \param fn A functor.
+  /// \param args Arguments of the functor.
   void execute(std::shared_ptr<Task> task)
   {
+    if (task == nullptr)
+    {
+      throw NullPointerException("Null task pointer");
+    }
+
+    // Proceed in 3 steps:
+    //
+    // 1. If fewer than corePoolSize threads are running, try to
+    // start a new thread with the given command as its first
+    // task.  The call to addWorker atomically checks runState and
+    // workerCount, and so prevents false alarms that would add
+    // threads when it shouldn't, by returning false.
+    //
+    // 2. If a task can be successfully queued, then we still need
+    // to double-check whether we should have added a thread
+    // (because existing ones died since last checking) or that
+    // the pool shut down since entry into this method. So we
+    // recheck state and if necessary roll back the enqueuing if
+    // stopped, or start a new thread if there are none.
+    //
+    // 3. If we cannot queue task, then we try to add a new
+    // thread.  If it fails, we know we are shut down or saturated
+    // and so reject the task.
+
     unsigned c = ctl_.load();
     if (workerCountOf(c) < core_pool_size_)
     {
@@ -155,10 +204,10 @@ public:
       reject(task);
   }
 
-  /// \fn void execute(Fn &&fn, Args &&...args)
-  /// \brief Execute a task.
-  /// \param fn a functor
-  /// \param args arguments of the functor
+  /// Execute a task.
+  ///
+  /// \param fn A functor.
+  /// \param args Arguments of the functor.
   template <typename Fn, typename... Args>
   void execute(Fn &&fn, Args &&...args)
   {
@@ -168,11 +217,11 @@ public:
   }
 
 
-  /// \fn std::future<?> submit(Fn &&fn, Args &&...args)
-  /// \brief Execute a task with returning future.
-  /// \param fn a functor
-  /// \param args arguments of the functor
-  /// \return a future of type fn(args...)
+  /// Execute a task with returning future.
+  ///
+  /// \param fn A functor.
+  /// \param args Arguments of the functor.
+  /// \return A future of type fn(args...).
   template <typename Fn, typename... Args>
   std::future<invoke_result_t<Fn, Args...>>
   submit(Fn &&fn, Args &&...args)
@@ -184,92 +233,98 @@ public:
     return task->getFuture();
   }
 
-  /// \brief Initiates an orderly shutdown in which previously submitted
-  ///        tasks are executed, but no new tasks will be accepted.
-  ///
+  /// Initiates an orderly shutdown in which previously submitted
+  /// tasks are executed, but no new tasks will be accepted.
   /// Invocation has no additional effect if already shut down.
   /// This method does not wait for previously submitted tasks to
-  /// complete execution.  Use awaitTermination to do that.
+  /// complete execution. Use awaitTermination to do that.
   void shutdown()
   {
     {
-      std::lock_guard<decltype(main_lock_)> lock(main_lock_);
+      boost::lock_guard<decltype(main_lock_)> lock(main_lock_);
 
-      try
-      {
-        // checkShutdownAccess();
-        advanceRunState(SHUTDOWN);
-        // interruptIdleWorkers();
-        onShutdown();
-      }
-      catch (...)
-      {}
+      // checkShutdownAccess();
+      advanceRunState(SHUTDOWN);
+      interruptIdleWorkers();
+      onShutdown();
     }
 
     tryTerminate();
   }
 
-  /// \brief  Transitions to TERMINATED state if either (SHUTDOWN and pool
-  ///         and queue empty) or (STOP and pool empty).  
+  /// Returns the current number of threads in the pool.
   ///
-  /// If otherwise eligible to terminate but workerCount is nonzero, 
-  /// interrupts an idle worker to ensure that shutdown signals propagate. 
-  /// This method must be called following any action that might make
-  /// termination possible -- reducing worker count or removing tasks
-  /// from the queue during shutdown. The method is non-private to
-  /// allow access from ScheduledThreadPoolExecutor.
-  void tryTerminate()
+  /// \return the number of threads
+  unsigned getPoolSize()
   {
-    for (;;)
-    {
-      unsigned c = ctl_.load();
-      if (isRunning(c) ||
-          runStateAtLeast(c, TIDYING) ||
-          (runStateOf(c) == SHUTDOWN && !task_queue_.isEmpty()))
-        return;
-      if (workerCountOf(c) != 0)
-      { 
-        // Eligible to terminate
-        constexpr bool ONLY_ONE = true;
-        interruptIdleWorkers(ONLY_ONE);
-        return;
-      }
-
-      std::lock_guard<decltype(main_lock_)> lock(main_lock_);
-
-      // If worker_manager_.size() > 0, that means some workers are not joined.
-      if(worker_manager_.size() > 0)
-        return ;
-
-      try
-      {
-        if (ctl_.compare_exchange_weak(c, ctlOf(TIDYING, 0)))
-        {
-          try
-          {
-            terminated();
-          }
-          catch(...) {
-            ctl_.store(ctlOf(TERMINATED, 0));
-            termination_.notify_all();
-          }
-
-          return;
-        }
-      }
-      catch(...) 
-      {}
-       // else retry on failed CAS
-    }
+    boost::lock_guard<decltype(main_lock_)> lock(main_lock_);
+    return runStateAtLeast(ctl_.load(), TIDYING) ? 0 : worker_manager_.workers_.size();
   }
 
-  /// \brief Returns the largest number of threads that have ever
-  ///        simultaneously been in the pool.
-  /// \return the number of threads
+  /// Returns the approximate number of threads that are actively
+  /// executing tasks.
+  ///
+  /// \return The number of threads.
+  unsigned getActiveCount()
+  {
+    unsigned n = 0u;
+    boost::lock_guard<decltype(main_lock_)> lock(main_lock_);
+    for(const auto &pair : worker_manager_.workers_)
+    {
+      const auto &worker = pair.second->worker_;
+      if(worker->isLocked())
+        ++n;
+    }
+    return n;
+  }
+
+  /// Returns the largest number of threads that have ever
+  /// simultaneously been in the pool.
+  ///
+  /// \return The number of threads.
   unsigned getLargestPoolSize()
   {
-    std::lock_guard<decltype(main_lock_)> lock(main_lock_);
+    boost::lock_guard<decltype(main_lock_)> lock(main_lock_);
     return largest_pool_size_;
+  }
+
+  /// Returns the approximate total number of tasks that have ever been
+  /// scheduled for execution. Because the states of tasks and
+  /// threads may change dynamically during computation, the returned
+  /// value is only an approximation.
+  ///
+  /// \return The number of tasks.
+  unsigned long long getTaskCount()
+  {
+    boost::lock_guard<decltype(main_lock_)> lock(main_lock_);
+    auto n = completed_task_count_;
+    for(const auto &pair : worker_manager_.workers_)
+    {
+      const auto &worker = pair.second->worker_;
+      n += worker->completed_tasks_;
+      if(worker->isLocked())
+        ++n;
+    }
+    return n+task_queue_.size();
+  }
+
+  /// Returns the approximate total number of tasks that have
+  /// completed execution. Because the states of tasks and threads
+  /// may change dynamically during computation, the returned value
+  /// is only an approximation, but one that does not ever decrease
+  /// across successive calls.
+  ///
+  /// \return the number of tasks
+  unsigned long long getCompletedTaskCount()
+  {
+    boost::lock_guard<decltype(main_lock_)> lock(main_lock_);
+    auto n = completed_task_count_;
+    for(const auto &pair : worker_manager_.workers_)
+    {
+      const auto &worker = pair.second->worker_;
+      n += worker->completed_tasks_;
+    }
+    return n;
   }
 
   bool isShutdown()
@@ -279,13 +334,19 @@ public:
 
   void onShutdown() {}
 
+protected:
+  virtual void beforeExecute(boost::thread &thread, std::shared_ptr<Task> task) {}
+  // virtual void afterExecute(std::shared_ptr<Task> task, std::exception e) {}
+  virtual void terminated() {}
 
 private:
   struct Worker
   {
     explicit Worker(std::shared_ptr<Task> task)
-        : first_task_(std::move(task))
-    {}
+        : first_task_(std::move(task)), inuse_(-1)
+    {
+      // inhibit interrupts until runWorker
+    }
 
     ~Worker()
     {
@@ -295,46 +356,118 @@ private:
 
     void run(ThreadPool &this_pool)
     {
-      thread_ = std::thread(&ThreadPool::runWorker, std::ref(this_pool), this);
+      thread_ = boost::thread(&ThreadPool::runWorker, boost::ref(this_pool), this);
+    }
+
+    void interruptIfStarted()
+    {
+      if (inuse_.load() >= 0 && thread_.joinable() && !thread_.interruption_requested())
+      {
+        thread_.interrupt();
+      }
+    }
+
+    void lock()
+    {
+      int old_val = 0;
+      while(!inuse_.compare_exchange_weak(old_val, 1))
+        ;
+    }
+
+    void unlock()
+    {
+      inuse_.store(0);
+    }
+
+    bool tryLock()
+    {
+      int old_val = 0;
+      return inuse_.compare_exchange_weak(old_val, 1); 
+    }
+
+    bool tryUnlock()
+    {
+      // int old_val = 1;
+      inuse_.store(0);
+      // return inuse_.compare_exchange_weak(old_val, 0); 
+      return true;
+    }
+
+    bool isLocked()
+    {
+      return inuse_.load() != 0;
     }
 
     unsigned long long completed_tasks_ = 0ull;
     std::shared_ptr<Task> first_task_;
-    std::thread thread_;
-  }; // struct Worker
+    std::atomic_int inuse_;
+    boost::thread thread_;
+  }; 
 
   struct WorkerManager
   {
+    struct Node
+    {
+      std::shared_ptr<Worker> worker_;
+      std::shared_ptr<Node> next_;
+    };
+
+    WorkerManager() : dying_workers_head_(new Node)
+    {
+      dying_workers_tail_ = dying_workers_head_;
+    }
+    
     void run(ThreadPool &pool)
     {
-      thread_ = std::thread(&ThreadPool::deleteWorkers, std::ref(pool), std::ref(*this));
+      thread_ = boost::thread(&ThreadPool::deleteWorkers, boost::ref(pool), boost::ref(*this));
     }
 
     void add(std::shared_ptr<Worker> w)
     {
-      workers_.insert(w);
+      std::shared_ptr<Node> node(new Node);
+      node->worker_ = w;
+      workers_.insert(std::make_pair<Worker *, std::shared_ptr<Node>>(w.get(), std::move(node)));
     }
 
     void remove(std::shared_ptr<Worker> w)
     {
-      workers_.erase(w);
+      workers_.erase(w.get());
     }
 
     void remove(Worker *w)
     {
-      auto it = workers_.begin();
-      while (it != workers_.end() && it->get() != w)
-        ++it;
-      assert(it != workers_.end() && "Try to remove a nonexistent worker!");
+      std::shared_ptr<Node> node = workers_[w];
+      workers_.erase(w);
 
-      std::lock_guard<decltype(mutex_)> lock(mutex_);
-      dead_workers_.push(*it);
-      workers_.erase(it);
+      boost::lock_guard<decltype(mutex_)> lock(mutex_);
+      dying_workers_tail_->next_ = node;
+      dying_workers_tail_ = node;
+
       cond_.notify_one();
     }
-    
+
+    void interruptIdleWorkers(bool only_one)
+    {
+      for(const auto &pair : workers_)
+      {
+        auto &worker = pair.second->worker_;
+        if(!worker->thread_.interruption_requested() && worker->tryLock())
+        {
+          worker->thread_.interrupt();
+          worker->unlock();
+        }
+        if (only_one)
+          break;
+      }
+    }
+
     void waitAllWorkersJoin()
     {
+      {
+        std::lock_guard<decltype(mutex_)> lock(mutex_);
+        cond_.notify_one();
+      }
+
       if(thread_.joinable())
         thread_.join();
     }
@@ -344,16 +477,32 @@ private:
       return workers_.size();
     }
 
-    std::mutex mutex_;
-    std::condition_variable cond_;
-    std::thread thread_;
-    std::unordered_set<std::shared_ptr<Worker>> workers_;
-    std::queue<std::shared_ptr<Worker>> dead_workers_;
+    boost::mutex mutex_;
+    boost::condition_variable cond_;
+    boost::thread thread_;
+    std::unordered_map<Worker *, std::shared_ptr<Node>> workers_;
+    std::shared_ptr<Node> dying_workers_head_;
+    std::shared_ptr<Node> dying_workers_tail_;
   };
 
+  /// Performs blocking or timed wait for a task, depending on
+  /// current configuration settings, or returns null if this worker
+  /// must exit because of any of:
+  /// 1. There are more than maximumPoolSize workers (due to
+  ///    a call to setMaximumPoolSize).
+  /// 2. The pool is stopped.
+  /// 3. The pool is shutdown and the queue is empty.
+  /// 4. This worker timed out waiting for a task, and timed-out
+  ///    workers are subject to termination (that is,
+  ///    { \code allowCoreThreadTimeOut || workerCount > corePoolSize \endcode })
+  ///    both before and after the timed wait, and if the queue is
+  ///    non-empty, this worker is not the last thread in the pool.
+  ///
+  /// \return task, or null if the worker must exit, in which case
+  ///         workerCount is decremented
   std::shared_ptr<Task> getTask()
   {
-    bool timedOut = false; // Did the last poll() time out?
+    bool timed_out = false; // Did the last poll() time out?
 
     for (;;)
     {
@@ -372,89 +521,99 @@ private:
       // Are workers subject to culling?
       bool timed = allow_core_thread_timeout_ || wc > core_pool_size_;
 
-      if ((wc > max_pool_size_ || (timed && timedOut)) && (wc > 1 || task_queue_.isEmpty()))
+      if ((wc > max_pool_size_ || (timed && timed_out)) && (wc > 1 || task_queue_.isEmpty()))
       {
         if (compareAndDecrementWorkerCount(c))
           return nullptr;
         continue;
       }
 
-      /* try
+      try
       {
-        auto r = timed ? workQueue.poll(keep_alive_time_, TimeUnit.NANOSECONDS) : workQueue.take();
-        if (r != nullptr)
-          return r;
-        timedOut = true;
-      }
-      catch (InterruptedException retry)
-      {
-        timedOut = false;
-      } */
-      auto nanos = keep_alive_time_;
-      for (;;)
-      {
-        std::shared_ptr<Task> task;
-        auto start_time = std::chrono::system_clock::now();
-        while (runStateOf(ctl_.load()) < STOP && !task_queue_.isEmpty() && !task_queue_.tryDequeue(task))
-          ;
-        auto end_time = std::chrono::system_clock::now();
-
+        auto task = timed ? task_queue_.poll(keep_alive_time_) : task_queue_.take();
         if (task != nullptr)
           return task;
-
-        if (runStateOf(ctl_.load()) >= SHUTDOWN)
-        {
-          break;
-        }
-
-        if (timed)
-        {
-          nanos -= end_time - start_time;
-          if (nanos.count() <= 0)
-          {
-            timedOut = true;
-            break;
-          }
-        }
+        timed_out = true;
       }
+      catch (boost::thread_interrupted &retry)
+      {
+        timed_out = false;
+      } 
     }
-
   }
 
   void runWorker(Worker *worker)
   {
-    std::shared_ptr<Task> task = std::move(worker->first_task_);
-    worker->first_task_.reset();
+    std::shared_ptr<Task> task = std::move(worker->first_task_); // worker->first_task_ is empty now.
+
+    worker->unlock();
 
     bool completed_abruptly = true;
-    try
+
+    auto finally1 = gsl::finally([&]{
+      processWorkerExit(worker, completed_abruptly); 
+    });
+
+    while (task || (task = getTask()))
     {
-      while (task || (task = getTask()))
-      {
+      boost::lock_guard<Worker> lock(*worker);
+
+      // Get interruption state and clear the state.
+      auto interrupted = [] {
+        bool is_interrupted = boost::this_thread::interruption_requested();
         try
         {
-          // beforeExecute();
-
-          (*task)();
-
-          // afterExecute();
+          boost::this_thread::interruption_point();
         }
-        catch (...)
-        {}
+        catch (boost::thread_interrupted &e)
+        { }
+        return is_interrupted;
+      };
 
-        task.reset();
-        ++worker->completed_tasks_;
+      if ((runStateAtLeast(ctl_.load(), STOP) ||
+           (interrupted() && runStateAtLeast(ctl_.load(), STOP))) &&
+          !worker->thread_.interruption_requested())
+        worker->thread_.interrupt();
+
+      {
+        auto finally2 = gsl::finally([&]
+        {
+          task.reset();
+          ++worker->completed_tasks_;
+        });
+
+        beforeExecute(worker->thread_, task);
+        // Throwable thrown;
+
+        {
+          /*
+            auto finally3 = gsl::finally([&]{
+              afterExecute(task, thrown);
+            });
+          */
+
+          try
+          {
+            (*task)();
+          }
+          catch (...)
+          { }
+
+          // finally3 executes here
+        }
+
+        // finally2 executes here.
+        //
+        // task.reset();
+        // ++worker->completed_tasks_;
       }
-
-      completed_abruptly = false;
     }
-    catch (...)
-    {}
 
-    processWorkerExit(worker, completed_abruptly); 
+    completed_abruptly = false;
 
-    // Worker's lifetime ends here.
-    // when runWorker ends, worker will be deleted from the memory.
+    // finally1 executes here.
+    //
+    // processWorkerExit(worker, completed_abruptly); 
   }
   
   bool addWorker(std::shared_ptr<Task> first_task, bool core)
@@ -479,10 +638,10 @@ private:
             wc >= (core ? core_pool_size_ : max_pool_size_))
           return false;
         if (compareAndIncrementWorkerCount(c))
-          goto done; //break retry;
+          goto done; // break retry;
         c = ctl_.load(); // Re-read ctl
         if (runStateOf(c) != rs)
-          break; //continue retry;
+          break; // continue retry;
         // else CAS failed due to workerCount change; retry inner loop
       }
     }
@@ -494,11 +653,11 @@ private:
     try
     {
       w.reset(new Worker(first_task));
-      //w->run(*this, w);
-      // std::Thread t = w.thread;
+      // w->run(*this, w);
+      // boost::thread t = w.thread;
       try
       {
-        std::lock_guard<decltype(main_lock_)> lock(main_lock_);
+        boost::lock_guard<decltype(main_lock_)> lock(main_lock_);
 
         // Recheck while holding lock.
         // Back out on ThreadFactory failure or if
@@ -534,7 +693,7 @@ private:
 
   void addWorkerFailed(std::shared_ptr<Worker> w)
   {
-    std::lock_guard<decltype(main_lock_)> lock(main_lock_);
+    boost::lock_guard<decltype(main_lock_)> lock(main_lock_);
     try
     {
       if (w != nullptr)
@@ -547,21 +706,70 @@ private:
   }
 
   void interruptIdleWorkers(bool only_one)
-  {}
+  {
+    boost::lock_guard<boost::recursive_mutex> lock(main_lock_);
+    worker_manager_.interruptIdleWorkers(only_one);
+  }
 
-protected:
-  virtual void beforeExecute(std::shared_ptr<Task> task, std::exception e) {}
-  virtual void afterExecute(std::shared_ptr<Task> task, std::exception e) {}
-  virtual void terminated() {}
+  void interruptIdleWorkers()
+  {
+    interruptIdleWorkers(false);
+  }
 
-private:
+  /// Transitions to TERMINATED state if either (SHUTDOWN and pool
+  /// and queue empty) or (STOP and pool empty).  
+  /// If otherwise eligible to terminate but workerCount is nonzero, 
+  /// interrupts an idle worker to ensure that shutdown signals propagate. 
+  /// This method must be called following any action that might make
+  /// termination possible -- reducing worker count or removing tasks
+  /// from the queue during shutdown. The method is non-private to
+  /// allow access from ScheduledThreadPoolExecutor.
+  void tryTerminate()
+  {
+    for (;;)
+    {
+      unsigned c = ctl_.load();
+      if (isRunning(c) ||
+          runStateAtLeast(c, TIDYING) ||
+          (runStateOf(c) == SHUTDOWN && !task_queue_.isEmpty()))
+        return;
+      if (workerCountOf(c) != 0)
+      { 
+        // Eligible to terminate
+        constexpr bool ONLY_ONE = true;
+        interruptIdleWorkers(ONLY_ONE);
+        return;
+      }
+
+      boost::lock_guard<decltype(main_lock_)> lock(main_lock_);
+
+      // If worker_manager_.size() > 0, that means some workers are not joined.
+      if(worker_manager_.size() > 0)
+        return ;
+
+      if (ctl_.compare_exchange_weak(c, ctlOf(TIDYING, 0)))
+      {
+        auto finally = gsl::finally([&]{
+          ctl_.store(ctlOf(TERMINATED, 0));
+          termination_.notify_all();
+        });
+
+        // May throw exception.
+        terminated();
+
+        return;
+      }
+       // else retry on failed CAS
+    }
+  }
+
   void processWorkerExit(Worker *w, bool completed_abruptly)
   {
     if (completed_abruptly) // If abrupt, then workerCount wasn't adjusted
       decrementWorkerCount();
 
     {
-      std::lock_guard<decltype(main_lock_)> lock(main_lock_);
+      boost::lock_guard<decltype(main_lock_)> lock(main_lock_);
       completed_task_count_ += w->completed_tasks_;
       worker_manager_.remove(w);
     }
@@ -573,7 +781,7 @@ private:
     {
       if (!completed_abruptly)
       {
-        //unsigned min = allowCoreThreadTimeOut ? 0 : core_pool_size_;
+        // unsigned min = allowCoreThreadTimeOut ? 0 : core_pool_size_;
         unsigned min = false ? 0u : core_pool_size_;
         if (min == 0u && !task_queue_.isEmpty())
           min = 1u;
@@ -586,29 +794,31 @@ private:
 
   void deleteWorkers(WorkerManager &manager)
   {
-    auto &dead_workers = manager.dead_workers_;
-    std::unique_lock<std::mutex> lock(manager.mutex_);
+    boost::unique_lock<decltype(manager.mutex_)> lock(manager.mutex_);
 
     for (;;)
     {
-      while (runStateLessThan(ctl_.load(), TIDYING) && dead_workers.empty())
+      while (runStateLessThan(ctl_.load(), TIDYING) && manager.dying_workers_head_ == manager.dying_workers_tail_)
         manager.cond_.wait(lock);
 
-      while (!dead_workers.empty())
+      while (manager.dying_workers_head_ != manager.dying_workers_tail_)
       {
-        std::shared_ptr<Worker> worker_holder = dead_workers.front();
-        dead_workers.pop();
+        auto node = manager.dying_workers_head_->next_;
+        if(manager.dying_workers_head_->next_ == manager.dying_workers_tail_)
+          manager.dying_workers_tail_ = manager.dying_workers_head_;
+        manager.dying_workers_head_->next_ = manager.dying_workers_head_->next_->next_;
+
+        assert(node.unique() && node->worker_.unique() && "Worker holder is not unique!");
 
         // unlock here
         lock.unlock();
 
-        assert(worker_holder.unique() && "Worker holder is not unique!");
         try
         {
-          worker_holder.reset(); // delete the worker
+          node.reset(); // delete the worker
         }
         catch (...)
-        {}
+        { }
 
         // lock again
         lock.lock();
@@ -617,7 +827,7 @@ private:
       // If the state is advanced to TIDYING, all workers have been enqueued to dead_workers.
       // When dead_workers is also empty, all threads are joined and the thread pool can 
       // release safely.
-      if (runStateAtLeast(ctl_.load(), TIDYING) && dead_workers.empty()) 
+      if (runStateAtLeast(ctl_.load(), TIDYING)) 
         return;
     }
   }
@@ -663,7 +873,7 @@ private:
   void decrementWorkerCount()
   {
     do
-    {}
+    { }
     while (!compareAndDecrementWorkerCount(ctl_.load()));
   }
 
@@ -683,8 +893,8 @@ private:
   unsigned largest_pool_size_ = 0u;
   std::chrono::nanoseconds keep_alive_time_;
 
-  std::recursive_mutex main_lock_;
-  std::condition_variable termination_;
+  boost::recursive_mutex main_lock_;
+  boost::condition_variable termination_;
   BlockingQueue task_queue_;
   WorkerManager worker_manager_;
   rejected_execution_handler_type handler_;

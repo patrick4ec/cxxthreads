@@ -170,6 +170,7 @@ struct Task
 {
   virtual ~Task() = default;
 
+  /// Inherited by subclass.
   virtual void operator()() = 0;
 };
 

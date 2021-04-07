@@ -5,9 +5,9 @@ add_executable(blocking_queue_test blocking_queue_test.cpp)
 add_executable(task_test task_test.cpp)
 add_executable(threadpool_test threadpool_test.cpp)
 
-target_link_libraries(blocking_queue_test Threads::Threads gtest_main)
+target_link_libraries(blocking_queue_test boost_chrono boost_thread gtest_main)
 target_link_libraries(task_test gtest_main)
-target_link_libraries(threadpool_test Threads::Threads gtest_main)
+target_link_libraries(threadpool_test boost_chrono boost_thread gtest_main)
 
 add_test(blocking_queue_test blocking_queue_test)
 add_test(task_test task_test)

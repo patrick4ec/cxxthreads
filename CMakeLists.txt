@@ -11,6 +11,8 @@ set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS} -O3 -Wall")
 include_directories(include)
 include_directories(external)
 
+include_directories(external/GSL/include)
+
 
 # unit test
 enable_testing()

@@ -1,68 +1,193 @@
-#include "gtest/gtest.h"
+#include <gtest/gtest.h>
 
 #include "cxxthreads/blocking_queue.h"
 
+#include <boost/thread.hpp>
 
-TEST(BlockingQueueTest, EnqueueAndDequeueWorks) 
+using cxxthreads::BlockingQueue;
+
+TEST(BlockingQueueTest, CapacityAndInitialSize) 
 {
-  cxxthreads::BlockingQueue<int> q(10);
-  for (int i = 1; i <= 10; ++i)
-  {
-    EXPECT_EQ(q.tryEnqueue(i), true);
-    EXPECT_EQ(q.size(), i);
-  }
-  EXPECT_EQ(q.tryEnqueue(11), false);
-  
-  int n;
-  for (int i = 1; i <= 10; ++i)
-  {
-    EXPECT_EQ(q.tryDequeue(n), true);
-  }
-  EXPECT_EQ(q.tryDequeue(n), false);
+  constexpr unsigned capacity = 1000u;
+  BlockingQueue<std::shared_ptr<int>> q{capacity};
+  ASSERT_EQ(q.capacity(), capacity);
+  ASSERT_EQ(q.size(), 0u);
 }
 
-TEST(BlockingQueueTest, MultiThreadTest)
+TEST(BlockingQueueTest, OfferAndPoll1) 
 {
-  cxxthreads::BlockingQueue<int> q(1000);
+  constexpr unsigned capacity = 1000u;
+  BlockingQueue<std::shared_ptr<int>> q{capacity};
 
-  std::atomic_uint total{0};
-
-  std::thread th1, th2, th3, th4;
-  auto enqueue_task = [&q, &total]
+  for(unsigned i=1u; i<=capacity; ++i)
   {
-    for(int i=0; i<100; ++i)
-    {
-      if(q.tryEnqueue(i))
-      {
-        ++total;
-      }
-    }
-  };
-  th1 = std::thread(enqueue_task);
-  th2 = std::thread(enqueue_task);
+    q.offer(std::make_shared<int>(i));
+    ASSERT_EQ(q.size(), i);
+  }
+
+  ASSERT_EQ(q.offer(std::make_shared<int>(capacity+1u)), false);
+
+  for(unsigned i=1u; i<=capacity; ++i)
+  {
+    auto n = q.poll();
+    ASSERT_EQ(*n, i);
+    ASSERT_EQ(q.size(), capacity-i);
+  }
+
+  ASSERT_EQ(q.poll(), nullptr);
+}
+
+TEST(BlockingQueueTest, OfferAndPoll2) 
+{
+  // Capacity is at least greater than zero.
+  constexpr unsigned capacity = 1u;
+  BlockingQueue<std::shared_ptr<int>> q{capacity};
+  q.offer(std::make_shared<int>(1));
+
+  boost::thread th1([&] {
+    std::chrono::milliseconds t(10);
+    q.offer(std::make_shared<int>(2), t);
+  });
 
   th1.join();
-  th2.join();
+  ASSERT_EQ(q.size(), 1u);
+}
 
-  ASSERT_EQ(q.size(), static_cast<int>(total));
+TEST(BlockingQueueTest, OfferAndPoll3) 
+{
+  // Capacity is at least greater than zero.
+  constexpr unsigned capacity = 1u;
+  BlockingQueue<std::shared_ptr<int>> q{capacity};
 
-  auto dequeue_task = [&q, &total]
-  {
-    while(static_cast<int>(total) > 0)
+  boost::thread th1([&] {
+    std::chrono::milliseconds t(10);
+    q.poll(t);
+  });
+
+  th1.join();
+  ASSERT_EQ(q.size(), 0u);
+}
+
+TEST(BlockingQueueTest, OfferAndPoll4) 
+{
+  // Capacity is at least greater than zero.
+  constexpr unsigned capacity = 1u;
+  BlockingQueue<std::shared_ptr<int>> q{capacity};
+  q.offer(std::make_shared<int>(1));
+
+  boost::thread th1([&] {
+    std::chrono::milliseconds t(10);
+    EXPECT_THROW(q.offer(std::make_shared<int>(2), t), boost::thread_interrupted);
+  });
+
+  th1.interrupt();
+  th1.join();
+  ASSERT_EQ(q.size(), 1u);
+}
+
+TEST(BlockingQueueTest, OfferAndPoll5) 
+{
+  // Capacity is at least greater than zero.
+  constexpr unsigned capacity = 1u;
+  BlockingQueue<std::shared_ptr<int>> q{capacity};
+
+  boost::thread th1([&] {
+    std::chrono::milliseconds t(10);
+    EXPECT_THROW(q.poll(t), boost::thread_interrupted);
+  });
+
+  th1.interrupt();
+  th1.join();
+  ASSERT_EQ(q.size(), 0u);
+}
+
+TEST(BlockingQueueTest, PutAndTake1) 
+{
+  constexpr unsigned capacity = 1000u;
+  BlockingQueue<std::shared_ptr<int>> q{capacity};
+
+  boost::thread th1([&] {
+    for (unsigned i = 1u; i <= capacity; ++i) 
     {
-      int n;
-      if(q.tryDequeue(n))
-      {
-        --total;
-      }
+      q.put(std::make_shared<int>(i));
+      ASSERT_EQ(q.size(), i);
     }
-  };
+  });
 
-  th3 = std::thread(dequeue_task);
-  th4 = std::thread(dequeue_task);
+  th1.join();
 
-  th3.join();
-  th4.join();
+  for(unsigned i=1u; i<=capacity; ++i)
+  {
+    auto n = q.take();
+    ASSERT_EQ(*n, i);
+    ASSERT_EQ(q.size(), capacity-i);
+  }
+}
 
-  ASSERT_EQ(q.size(), 0);
+TEST(BlockingQueueTest, PutAndTake2) 
+{
+  constexpr unsigned capacity = 1000u;
+  BlockingQueue<std::shared_ptr<int>> q{capacity};
+
+  boost::thread th1([&] {
+    for (unsigned i = 1u; i < capacity; ++i)
+      q.put(std::make_shared<int>(i));
+  });
+
+  for(unsigned i=1u; i<capacity; ++i)
+  {
+    auto n = q.take();
+    ASSERT_EQ(*n, i);
+  }
+
+  th1.join();
+}
+
+TEST(BlockingQueueTest, PutAndTake3) 
+{
+  constexpr unsigned capacity = 1000u;
+  BlockingQueue<std::shared_ptr<int>> q{capacity};
+
+  boost::thread th1([&] {
+    for (unsigned i = 1u; i < capacity; ++i)
+    {
+      auto n = q.take();
+      ASSERT_EQ(*n, i);
+    }
+  });
+
+  for(unsigned i=1u; i<capacity; ++i)
+  {
+    q.put(std::make_shared<int>(i));
+  }
+
+  th1.join();
+}
+
+TEST(BlockingQueueTest, PutAndTake4) 
+{
+  // Capacity is at least greater than zero.
+  constexpr unsigned capacity = 1u;
+  BlockingQueue<std::shared_ptr<int>> q{capacity};
+  q.put(std::make_shared<int>(1));
+
+  boost::thread th1([&] {
+    ASSERT_THROW(q.put(std::make_shared<int>(1)), boost::thread_interrupted);
+  });
+
+  th1.interrupt();
+  th1.join();
+}
+
+TEST(BlockingQueueTest, PutAndTake5) 
+{
+  constexpr unsigned capacity = 1000u;
+  BlockingQueue<std::shared_ptr<int>> q{capacity};
+
+  boost::thread th1([&] {
+    ASSERT_THROW(q.take(), boost::thread_interrupted);
+  });
+
+  th1.interrupt();
+  th1.join();
 }
