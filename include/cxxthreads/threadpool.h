@@ -332,6 +332,27 @@ public:
     return !isRunning(ctl_.load());
   }
 
+  template <typename Rep, typename Period>
+  bool awaitTermination(const std::chrono::duration<Rep, Period> &timeout)
+  {
+    boost::chrono::nanoseconds boost_timeout{std::chrono::duration_cast<std::chrono::nanoseconds>(timeout).count()};
+
+    boost::unique_lock<decltype(main_lock_)> lock(main_lock_);
+    for(;;)
+    {
+      if (runStateAtLeast(ctl_.load(), TERMINATED))
+        return true;
+      if (timeout.count() <= 0)
+        return false;
+      auto time_begin = boost::chrono::system_clock::now();
+      auto status = termination_.wait_for(lock, boost_timeout);
+      if(status == boost::cv_status::timeout)
+        return false;
+      auto time_end = boost::chrono::system_clock::now();
+      boost_timeout -= time_end - time_begin;
+    }
+  }
+
   void onShutdown() {}
 
 protected:
@@ -894,7 +915,7 @@ private:
   std::chrono::nanoseconds keep_alive_time_;
 
   boost::recursive_mutex main_lock_;
-  boost::condition_variable termination_;
+  boost::condition_variable_any termination_;
   BlockingQueue task_queue_;
   WorkerManager worker_manager_;
   rejected_execution_handler_type handler_;
