@@ -357,7 +357,7 @@ public:
 
 protected:
   virtual void beforeExecute(boost::thread &thread, std::shared_ptr<Task> task) {}
-  // virtual void afterExecute(std::shared_ptr<Task> task, std::exception e) {}
+  virtual void afterExecute(std::shared_ptr<Task> task, std::exception_ptr eptr) {}
   virtual void terminated() {}
 
 private:
@@ -607,20 +607,24 @@ private:
         // Throwable thrown;
 
         {
-          /*
-            auto finally3 = gsl::finally([&]{
-              afterExecute(task, thrown);
-            });
-          */
+          std::exception_ptr eptr;
+
+          auto finally3 = gsl::finally([&] {
+            afterExecute(task, eptr);
+          });
 
           try
           {
             (*task)();
           }
           catch (...)
-          { }
+          {
+            eptr = std::current_exception();
+          }
 
           // finally3 executes here
+          //
+          // afterExecute(task, eptr);
         }
 
         // finally2 executes here.
