@@ -18,7 +18,7 @@
 #include "task.h"
 #include "util.h"
 
-#include <gsl/util>
+#include <gsl/gsl_util>
 
 #include <boost/thread.hpp>
 
