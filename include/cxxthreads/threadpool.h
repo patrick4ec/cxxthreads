@@ -32,6 +32,52 @@
 namespace cxxthreads 
 {
 
+  namespace detail
+  {
+    template <typename T>
+    struct list
+    {
+      struct Node
+      {
+        std::shared_ptr<T> data_;
+        std::shared_ptr<Node> next_;
+      };
+
+      list() : head_(new Node)
+      {
+        tail_ = head_;
+      }
+
+      void pushTail(std::shared_ptr<Node> new_node) noexcept
+      {
+        tail_->next_ = new_node;
+        tail_ = tail_->next_;
+      }
+
+      std::shared_ptr<Node> popHead() noexcept
+      {
+        if(empty())
+          return nullptr;
+        
+        auto node = head_->next_;
+        if(head_->next_ == tail_)
+          tail_ = head_;
+        head_->next_ = head_->next_->next_;
+        return node;
+      }
+
+      bool empty() const noexcept
+      {
+        return head_ == tail_;
+      }
+
+      std::shared_ptr<Node> head_;
+      std::shared_ptr<Node> tail_;
+    };
+  }; // namespace detail
+
+
+
 /// A dynamic thread pool implementation.
 /// \headerfile "cxxthreads/threadpool.h"
 template<typename BlockingQueue>
@@ -321,7 +367,7 @@ public:
     auto n = completed_task_count_;
     for(const auto &pair : worker_manager_.workers_)
     {
-      const auto &worker = pair.second->worker_;
+      const auto &worker = pair.second->data_;
       n += worker->completed_tasks_;
     }
     return n;
@@ -427,26 +473,17 @@ private:
 
   struct WorkerManager
   {
-    struct Node
-    {
-      std::shared_ptr<Worker> worker_;
-      std::shared_ptr<Node> next_;
-    };
-
-    WorkerManager() : dying_workers_head_(new Node)
-    {
-      dying_workers_tail_ = dying_workers_head_;
-    }
+    using Node = typename detail::list<Worker>::Node;
     
     void run(ThreadPool &pool)
     {
-      thread_ = boost::thread(&ThreadPool::deleteWorkers, boost::ref(pool), boost::ref(*this));
+      thread_ = boost::thread(&ThreadPool::joinDyingWorkers, boost::ref(pool), boost::ref(*this));
     }
 
     void add(std::shared_ptr<Worker> w)
     {
       std::shared_ptr<Node> node(new Node);
-      node->worker_ = w;
+      node->data_ = w;
       workers_.insert(std::make_pair<Worker *, std::shared_ptr<Node>>(w.get(), std::move(node)));
     }
 
@@ -459,10 +496,10 @@ private:
     {
       std::shared_ptr<Node> node = workers_[w];
       workers_.erase(w);
+      // node.unique() == true && node->data_.unique() == true
 
       boost::lock_guard<decltype(mutex_)> lock(mutex_);
-      dying_workers_tail_->next_ = node;
-      dying_workers_tail_ = node;
+      dying_workers_.pushTail(std::move(node));
 
       cond_.notify_one();
     }
@@ -471,7 +508,7 @@ private:
     {
       for(const auto &pair : workers_)
       {
-        auto &worker = pair.second->worker_;
+        auto &worker = pair.second->data_;
         if(!worker->thread_.interruption_requested() && worker->tryLock())
         {
           worker->thread_.interrupt();
@@ -502,8 +539,7 @@ private:
     boost::condition_variable cond_;
     boost::thread thread_;
     std::unordered_map<Worker *, std::shared_ptr<Node>> workers_;
-    std::shared_ptr<Node> dying_workers_head_;
-    std::shared_ptr<Node> dying_workers_tail_;
+    detail::list<Worker> dying_workers_;
   };
 
   /// Performs blocking or timed wait for a task, depending on
@@ -817,23 +853,22 @@ private:
     }
   }
 
-  void deleteWorkers(WorkerManager &manager)
+  void joinDyingWorkers(WorkerManager &manager)
   {
+    auto &dying_workers = manager.dying_workers_;
+    
     boost::unique_lock<decltype(manager.mutex_)> lock(manager.mutex_);
 
     for (;;)
     {
-      while (runStateLessThan(ctl_.load(), TIDYING) && manager.dying_workers_head_ == manager.dying_workers_tail_)
+      while (runStateLessThan(ctl_.load(), TIDYING) && dying_workers.empty())
         manager.cond_.wait(lock);
 
-      while (manager.dying_workers_head_ != manager.dying_workers_tail_)
+      while (!dying_workers.empty())
       {
-        auto node = manager.dying_workers_head_->next_;
-        if(manager.dying_workers_head_->next_ == manager.dying_workers_tail_)
-          manager.dying_workers_tail_ = manager.dying_workers_head_;
-        manager.dying_workers_head_->next_ = manager.dying_workers_head_->next_->next_;
+        auto node = dying_workers.popHead();
 
-        assert(node.unique() && node->worker_.unique() && "Worker holder is not unique!");
+        assert(node.unique() && node->data_.unique() && "Worker holder is not unique!");
 
         // unlock here
         lock.unlock();

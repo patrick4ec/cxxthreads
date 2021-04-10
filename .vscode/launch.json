@@ -4,31 +4,12 @@
     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
-    {
-        "name": "(gdb) Attach",
-        "type": "cppdbg",
-        "request": "attach",
-        "program": "${workspaceFolder}/build/src/main",
-        "processId": "${command:pickProcess}",
-        "MIMode": "gdb",
-        "setupCommands": [
-            {
-                "description": "Enable pretty-printing for gdb",
-                "text": "-enable-pretty-printing",
-                "ignoreFailures": true
-            }
-        ]
-    },
         {
-            "name": "clang++ - Build and debug active file",
+            "name": "(gdb) Attach",
             "type": "cppdbg",
-            "request": "launch",
-            "program": "${fileDirname}/../build/${fileBasenameNoExtension}",
-            "args": [],
-            "stopAtEntry": false,
-            "cwd": "${workspaceFolder}",
-            "environment": [],
-            "externalConsole": false,
+            "request": "attach",
+            "program": "${workspaceFolder}/build/src/main",
+            "processId": "${command:pickProcess}",
             "MIMode": "gdb",
             "setupCommands": [
                 {
@@ -36,15 +17,13 @@
                     "text": "-enable-pretty-printing",
                     "ignoreFailures": true
                 }
-            ],
-            "preLaunchTask": "C/C++: clang++ build active file",
-            "miDebuggerPath": "/usr/bin/gdb"
+            ]
         },
         {
-            "name": "debug blocking_queue_test",
+            "name": "Debug active file",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/test/blocking_queue_test",
+            "program": "${workspaceFolder}/build/test/${fileBasenameNoExtension}",
             "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
@@ -61,31 +40,11 @@
             "miDebuggerPath": "/usr/bin/gdb"
         },
         {
-            "name": "debug threadpool_test",
+            "name": "Debug benchmark_pool",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/test/threadpool_test",
-            "args": [],
-            "stopAtEntry": false,
-            "cwd": "${workspaceFolder}",
-            "environment": [],
-            "externalConsole": false,
-            "MIMode": "gdb",
-            "setupCommands": [
-                {
-                    "description": "Enable pretty-printing for gdb",
-                    "text": "-enable-pretty-printing",
-                    "ignoreFailures": true
-                }
-            ],
-            "miDebuggerPath": "/usr/bin/gdb"
-        },
-        {
-            "name": "debug blocking_queue_test",
-            "type": "cppdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/build/test/blocking_queue_test",
-            "args": [],
+            "program": "${workspaceFolder}/external/threadpool_benchmark/benchmark_pool",
+            "args": ["20000", "16"],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
             "environment": [],
