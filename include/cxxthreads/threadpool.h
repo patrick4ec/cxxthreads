@@ -50,7 +50,7 @@ namespace cxxthreads
 
       void pushTail(std::shared_ptr<Node> new_node) noexcept
       {
-        tail_->next_ = new_node;
+        tail_->next_ = std::move(new_node);
         tail_ = tail_->next_;
       }
 
@@ -79,6 +79,7 @@ namespace cxxthreads
 
 
 /// A dynamic thread pool implementation.
+///
 /// \headerfile "cxxthreads/threadpool.h"
 template<typename BlockingQueue>
 class ThreadPool 
@@ -122,8 +123,8 @@ public:
     /// Executes task in the caller's thread, unless the executor
     /// has been shut down, in which case the task is discarded.
     ///
-    /// @param task The runnable task requested to be executed.
-    /// @param pool The executor attempting to execute this task.
+    /// \param task The runnable task requested to be executed.
+    /// \param pool The executor attempting to execute this task.
     void operator()(std::shared_ptr<Task> task, ThreadPool &pool)
     {
       if (!pool.isShutdown())
@@ -298,9 +299,76 @@ public:
     tryTerminate();
   }
 
+  /// Returns true if this pool allows core threads to time out and
+  /// terminate if no tasks arrive within the keepAlive time, being
+  /// replaced if needed when new tasks arrive. When true, the same
+  /// keep-alive policy applying to non-core threads applies also to
+  /// core threads. When false (the default), core threads are never
+  /// terminated due to lack of incoming tasks.
+  ///
+  /// \return True if core threads are allowed to time out,
+  ///         else false.
+  bool allowCoreThreadTimeOut()
+  {
+    return allow_core_thread_timeout_;   
+  }
+
+  /// Sets the policy governing whether core threads may time out and
+  /// terminate if no tasks arrive within the keep-alive time, being
+  /// replaced if needed when new tasks arrive. When false, core
+  /// threads are never terminated due to lack of incoming
+  /// tasks. When true, the same keep-alive policy applying to
+  /// non-core threads applies also to core threads. To avoid
+  /// continual thread replacement, the keep-alive time must be
+  /// greater than zero when setting true. This method
+  /// should in general be called before the pool is actively used.
+  ///
+  /// \param value True if should time out, else false.
+  /// \throws std::invalid_argument if value is true
+  ///         and the current keep-alive time is not greater than zero.
+  void allowCoreThreadTimeOut(bool value)
+  {
+    if(value && keep_alive_time_.count() <= 0)
+      throw std::invalid_argument("Core threads must have nonzero keep alive times");
+    if(value != allow_core_thread_timeout_)
+    {
+      allow_core_thread_timeout_ = value;
+      if(value)
+        interruptIdleWorkers();
+    }
+  }
+
+  /// Sets the maximum allowed number of threads. This overrides any
+  /// value set in the constructor. If the new value is smaller than
+  /// the current value, excess existing threads will be
+  /// terminated when they next become idle.
+  ///
+  /// \param max_pool_size The new maximum allowed number of threads.
+  /// \throws std::invalid_argument if the new maximum is
+  ///         less than or equal to zero, or
+  ///         less than the core pool size.
+  /// \see getMaxPoolSize
+  void setMaxPoolSize(unsigned max_pool_size)
+  {
+    if(max_pool_size <= 0u || max_pool_size < core_pool_size_)
+      throw std::invalid_argument("Invalid maximum pool size");
+    this->max_pool_size_ = max_pool_size;
+    if(workerCountOf(ctl_.load()) > this->max_pool_size_)
+      interruptIdleWorkers();
+  }
+
+  /// Returns the maximum allowed number of threads.
+  ///
+  /// \return The maximum allowed number of threads.
+  /// \see setMaxPoolSize
+  unsigned getMaxPoolSize()
+  {
+    return max_pool_size_;
+  }
+
   /// Returns the current number of threads in the pool.
   ///
-  /// \return the number of threads
+  /// \return The number of threads.
   unsigned getPoolSize()
   {
     boost::lock_guard<decltype(main_lock_)> lock(main_lock_);
@@ -372,6 +440,15 @@ public:
     }
     return n;
   }
+
+/*
+  void shutdownNow()
+  {
+    boost::lock_guard<decltype(main_lock_)> lock(main_lock_);
+    advanceRunState(STOP);
+    interruptWorkers();
+  }
+*/
 
   bool isShutdown()
   {
@@ -768,13 +845,23 @@ private:
 
   void interruptIdleWorkers(bool only_one)
   {
-    boost::lock_guard<boost::recursive_mutex> lock(main_lock_);
+    boost::lock_guard<decltype(main_lock_)> lock(main_lock_);
     worker_manager_.interruptIdleWorkers(only_one);
   }
 
   void interruptIdleWorkers()
   {
     interruptIdleWorkers(false);
+  }
+
+  void interruptWorkers()
+  {
+    std::lock_guard<decltype(main_lock_)> lock(main_lock_);
+    for (const auto &pair : worker_manager_.workers_)
+    {
+      auto &worker = pair.second->data_;
+      worker.interruptIfStarted();
+    }
   }
 
   /// Transitions to TERMINATED state if either (SHUTDOWN and pool
