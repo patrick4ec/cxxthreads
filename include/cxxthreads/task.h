@@ -245,7 +245,7 @@ private:
   std::promise<result_type> result_;
 };
 
-template <template <typename> typename Task, typename Func, typename... Args>
+template <template <typename> class Task, typename Func, typename... Args>
 decltype(auto) createTask(Func &&f, Args &&...args)
 {
   auto bind_result = std::bind(std::forward<Func>(f), std::forward<Args>(args)...);
